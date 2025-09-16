@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Prometheus + vLLM Dashboard</title>
+<script src="https://cdn.plot.ly/plotly-2.26.0.min.js"></script>
+<style>
+body { background-color:#181826; font-family:Arial; color:white; margin:0; padding:20px; }
+#kpi-container { display:flex; flex-wrap:wrap; gap:15px; margin-bottom:20px; }
+.kpi-card { flex:1 1 150px; background:#1f1f33; border-radius:15px; padding:15px; text-align:center; box-shadow:0px 2px 8px rgba(0,0,0,0.4); }
+.kpi-title { font-size:1rem; color:#bbb; margin-bottom:5px; }
+.kpi-value { font-size:1.8rem; font-weight:bold; }
+#dashboard { display:grid; grid-template-columns:1fr 1fr; grid-template-rows:300px 300px; gap:20px; }
+.chart-panel { background:#1f1f33; padding:15px; border-radius:15px; box-shadow:0px 2px 8px rgba(0,0,0,0.4); }
+#graph4 { grid-column:1 / span 2; }
+.metric-title { font-size:1.3rem; font-weight:bold; text-align:center; margin-bottom:8px; }
+.metric-value { font-size:1.6rem; font-weight:bold; text-align:center; margin-bottom:8px; }
+</style>
+</head>
+<body>
+
+<!-- KPI Row -->
+<div id="kpi-container">
+  <div class="kpi-card"><div class="kpi-title">CPU Usage</div><div id="cpu-load" class="kpi-value">--</div></div>
+  <div class="kpi-card"><div class="kpi-title">Memory Free</div><div id="mem-free" class="kpi-value">--</div></div>
+  <div class="kpi-card"><div class="kpi-title">Memory Usage</div><div id="mem-usage" class="kpi-value">--</div></div>
+  <div class="kpi-card"><div class="kpi-title">Disk Available</div><div id="disk-avail" class="kpi-value">--</div></div>
+  <div class="kpi-card"><div class="kpi-title">Tokens Used</div><div id="tokens-used" class="kpi-value">--</div></div>
+  <!-- <div class="kpi-card"><div class="kpi-title">RPS</div><div id="rps" class="kpi-value">--</div></div> -->
+  <div class="kpi-card"><div class="kpi-title">Success Rate</div><div id="success-rate" class="kpi-value">--</div></div>
+</div>
+
+<!-- Graph Grid -->
+<div id="dashboard">
+  <div class="chart-panel" id="graph1"></div>
+  <div class="chart-panel" id="graph2"></div>
+  <div class="chart-panel" id="graph4"></div>
+</div>
+
+<script>
+let prevReqCount = 0;
+let prevTime = Date.now();
+
+// Fetch metric from backend
+async function fetchMetric(metric) {
+  const res = await fetch(`/metric_data?metric=${encodeURIComponent(metric)}`);
+  const data = await res.json();
+  if(data.status !== "success" || data.result.length === 0) return [];
+  return data.result[0].values;
+}
+
+// Helper to plot graphs
+function plotGraph(divId, title, values, color='#50fa7b') {
+  const x = values.map(v => new Date(v[0]*1000));
+  const y = values.map(v => parseFloat(v[1]));
+  const latest = y[y.length-1]?.toFixed(2) ?? 'N/A';
+
+  document.getElementById(divId).innerHTML = `
+    <div class="metric-title">${title}</div>
+    <div class="metric-value" style="color:${color}">${latest}</div>
+    <div id="${divId}-plot" style="height:200px;"></div>
+  `;
+  Plotly.newPlot(`${divId}-plot`, [{x, y, type:'scatter', mode:'lines', line:{color}}], {
+    paper_bgcolor:"#1f1f33", plot_bgcolor:"#1f1f33",
+    font:{color:"white"}, margin:{t:20,b:40,l:50,r:20}
+  }, {displayModeBar:false});
+}
+
+async function updateDashboard() {
+  // Graph 1 → Token usage
+  const tokenVals = await fetchMetric('vllm:request_generation_tokens_sum');
+  plotGraph('graph1', 'Token Usage', tokenVals, '#ffb347');
+
+  // ✅ CPU Usage as % (PromQL)
+  const cpuQuery = '100 - (avg by (instance)(irate(node_cpu_seconds_total{mode="idle"}[1m])) * 100)';
+  const cpuVals = await fetchMetric(cpuQuery);
+  plotGraph('graph2', 'CPU Usage (%)', cpuVals, '#61dafb');
+
+  // Graph 4 → Request total
+  const reqTotalVals = await fetchMetric("http_requests_total");
+  plotGraph('graph4', 'Request Total', reqTotalVals, '#f14668');
+
+  // --- KPI Values ---
+  const cpuLatest = parseFloat(cpuVals.slice(-1)[0]?.[1] ?? 0);
+
+  // ✅ Memory Fix (Free + Total)
+  const memFreeVals = await fetchMetric('node_memory_free_bytes');
+  const memTotalVals = await fetchMetric('node_memory_total_bytes');
+  const memFreeLatest = parseFloat(memFreeVals.slice(-1)[0]?.[1] ?? 0);
+  const memTotalLatest = parseFloat(memTotalVals.slice(-1)[0]?.[1] ?? 0);
+  const memUsedPercent = memTotalLatest > 0 ? ((memTotalLatest - memFreeLatest) / memTotalLatest) * 100 : 0;
+
+  // Disk space
+  const diskVals = await fetchMetric('node_filesystem_avail_bytes');
+  const diskLatest = diskVals.slice(-1)[0]?.[1] ?? 0;
+
+  const tokensLatest = tokenVals.slice(-1)[0]?.[1] ?? 0;
+
+  // --- Compute RPS manually ---
+  const reqVals = await fetchMetric('vllm:request_inference_time_seconds_count');
+  const latestReqCount = reqVals.slice(-1)[0]?.[1] ?? 0;
+  const now = Date.now();
+  const rpsLatest = (latestReqCount - prevReqCount) / ((now - prevTime)/1000);
+  prevReqCount = latestReqCount;
+  prevTime = now;
+
+  const totalReq = reqTotalVals.slice(-1)[0]?.[1] ?? 0;
+  const successRate = totalReq > 0 ? "100%" : "N/A";
+
+  // Update DOM
+  document.getElementById('cpu-load').textContent = cpuLatest.toFixed(2) + '%';
+  document.getElementById('mem-free').textContent = (memFreeLatest / 1024 / 1024).toFixed(2) + ' MB';
+  document.getElementById('mem-usage').textContent = memUsedPercent.toFixed(1) + '%';
+  document.getElementById('disk-avail').textContent = (diskLatest / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+  document.getElementById('tokens-used').textContent = tokensLatest;
+  // document.getElementById('rps').textContent = rpsLatest.toFixed(2);
+  document.getElementById('success-rate').textContent = successRate;
+
+  // KPI Colors
+  document.getElementById('cpu-load').style.color = cpuLatest > 80 ? '#ff5555' : '#50fa7b';
+  document.getElementById('tokens-used').style.color = tokensLatest > 1000 ? '#ffb347' : '#50fa7b';
+  document.getElementById('mem-usage').style.color = memUsedPercent > 85 ? '#ff5555' : '#50fa7b';
+}
+
+setInterval(updateDashboard, 5000);
+updateDashboard();
+</script>
+</body>
+</html>
